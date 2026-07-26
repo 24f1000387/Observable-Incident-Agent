@@ -5,13 +5,12 @@ import hashlib
 import time
 import secrets
 from typing import Dict, Any, List, Optional
-from fastapi import FastAPI, HTTPException, Request, Response, status
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
 import openai
 
 # =====================================================================
-# Database Setup (SQLite for persistent run state & idempotency)
+# Database Setup
 # =====================================================================
 DB_FILE = "incident_agent.db"
 
@@ -41,10 +40,10 @@ def init_db():
 
 init_db()
 
-app = FastAPI(title="Observable Incident Agent", version="v2")
+app = FastAPI(title="Observable Incident Agent", version="v2", redirect_slashes=False)
 
 # =====================================================================
-# Helpers: Digest Calculation & Canonical JSON
+# Helpers
 # =====================================================================
 def compute_hash(data: Any) -> str:
     canonical = json.dumps(data, sort_keys=True, separators=(',', ':'))
@@ -119,39 +118,38 @@ def build_otlp_trace(state: Dict[str, Any]) -> Dict[str, Any]:
         {"key": "ga5.public.marker", "value": {"stringValue": public_marker}}
     ]
     
-    # 1. SERVER Span: POST /v2/incidents
+    # 1. SERVER Span
     spans.append({
         "traceId": trace_id,
         "spanId": server_span_id,
         "name": "POST /v2/incidents",
-        "kind": 2,  # SERVER
+        "kind": 2,
         "attributes": common_attrs
     })
     
-    # 2. INTERNAL Span: invoke_agent
+    # 2. INTERNAL invoke_agent Span
     spans.append({
         "traceId": trace_id,
         "spanId": agent_span_id,
         "parentSpanId": server_span_id,
         "name": f"invoke_agent {agent_name}",
-        "kind": 1,  # INTERNAL
+        "kind": 1,
         "attributes": common_attrs
     })
     
-    # 3. CLIENT Span: chat incident-plan (Exactly 1)
+    # 3. CLIENT chat incident-plan Span
     spans.append({
         "traceId": trace_id,
         "spanId": chat_span_id,
         "parentSpanId": agent_span_id,
         "name": "chat incident-plan",
-        "kind": 3,  # CLIENT
+        "kind": 3,
         "attributes": common_attrs + [
             {"key": "gen_ai.operation.name", "value": {"stringValue": "chat"}},
             {"key": "gen_ai.request.model", "value": {"stringValue": state.get("modelName", "gpt-4o-mini")}}
         ]
     })
     
-    # 4. Tool Execution Spans (Diagnostic & Effect)
     diagnostic_exec_span_ids = []
     
     for action in state.get("actionLog", []):
@@ -165,7 +163,7 @@ def build_otlp_trace(state: Dict[str, Any]) -> Dict[str, Any]:
             "spanId": exec_span_id,
             "parentSpanId": agent_span_id,
             "name": f"execute_tool {action['toolName']}",
-            "kind": 1,  # INTERNAL
+            "kind": 1,
             "attributes": common_attrs + [
                 {"key": "ga5.action.id", "value": {"stringValue": action["actionId"]}},
                 {"key": "gen_ai.tool.name", "value": {"stringValue": action["toolName"]}},
@@ -174,10 +172,7 @@ def build_otlp_trace(state: Dict[str, Any]) -> Dict[str, Any]:
             ]
         })
         
-        # Parse CLIENT Span ID from outgoing traceparent (00-traceId-clientSpanId-01)
         client_span_id = action["traceparent"].split("-")[2]
-        
-        # Locate corresponding outcome receipt in receiptLog
         receipt = next((r for r in state.get("receiptLog", []) 
                         if r.get("actionId") == action["actionId"] and r.get("attempt") == action["attempt"]), None)
         
@@ -188,7 +183,7 @@ def build_otlp_trace(state: Dict[str, Any]) -> Dict[str, Any]:
             {"key": "http.request.resend_count", "value": {"intValue": action["attempt"] - 1}}
         ]
         
-        span_status = {"code": 0}  # UNSET by default
+        span_status = {"code": 0}
         
         if receipt:
             client_attrs.append({"key": "ga5.receipt.id", "value": {"stringValue": receipt["receiptId"]}})
@@ -199,10 +194,10 @@ def build_otlp_trace(state: Dict[str, Any]) -> Dict[str, Any]:
             res_cls = receipt.get("resultClass", "")
             
             if st_code == 503 or res_cls == "503":
-                span_status = {"code": 2}  # ERROR
+                span_status = {"code": 2}
                 client_attrs.append({"key": "error.type", "value": {"stringValue": "503"}})
             elif st_code == 0 or res_cls == "timeout":
-                span_status = {"code": 2}  # ERROR
+                span_status = {"code": 2}
                 client_attrs.append({"key": "error.type", "value": {"stringValue": "timeout"}})
 
         spans.append({
@@ -210,12 +205,12 @@ def build_otlp_trace(state: Dict[str, Any]) -> Dict[str, Any]:
             "spanId": client_span_id,
             "parentSpanId": exec_span_id,
             "name": f"POST tool/{action['toolName']}",
-            "kind": 3,  # CLIENT
+            "kind": 3,
             "attributes": client_attrs,
             "status": span_status
         })
 
-    # 5. Join Span (for parallel diagnostics)
+    # Join span for parallel diagnostics
     if len(diagnostic_exec_span_ids) > 1:
         join_span_id = f"{hashlib.sha256((run_id + '_join').encode()).hexdigest()[:16]}"
         spans.append({
@@ -223,12 +218,12 @@ def build_otlp_trace(state: Dict[str, Any]) -> Dict[str, Any]:
             "spanId": join_span_id,
             "parentSpanId": agent_span_id,
             "name": "incident.join",
-            "kind": 1,  # INTERNAL
+            "kind": 1,
             "attributes": common_attrs,
             "links": [{"traceId": trace_id, "spanId": sid} for sid in diagnostic_exec_span_ids]
         })
         
-    # 6. Approval Gate Span (if approval occurred)
+    # Approval gate span
     appr_receipt = next((r for r in state.get("receiptLog", []) if "approvalId" in r), None)
     if appr_receipt:
         gate_span_id = f"{hashlib.sha256((run_id + '_appr').encode()).hexdigest()[:16]}"
@@ -237,7 +232,7 @@ def build_otlp_trace(state: Dict[str, Any]) -> Dict[str, Any]:
             "spanId": gate_span_id,
             "parentSpanId": agent_span_id,
             "name": "approval_gate",
-            "kind": 1,  # INTERNAL
+            "kind": 1,
             "attributes": common_attrs + [
                 {"key": "ga5.approval.id", "value": {"stringValue": appr_receipt["approvalId"]}},
                 {"key": "ga5.receipt.nonce", "value": {"stringValue": appr_receipt["nonce"]}}
@@ -252,24 +247,28 @@ def build_otlp_trace(state: Dict[str, Any]) -> Dict[str, Any]:
         }]
     }
 
-# =====================================================================
-# Response Formatter
-# =====================================================================
 def build_client_response(state: Dict[str, Any]) -> Dict[str, Any]:
     st = state["status"]
-    
     if st == "waiting":
-        resp = {
+        # Format approvals clean of private internal argument mappings
+        clean_approvals = [
+            {
+                "approvalId": a["approvalId"],
+                "actionId": a["actionId"],
+                "toolName": a["toolName"],
+                "argumentsDigest": a["argumentsDigest"]
+            }
+            for a in state.get("approvals", [])
+        ]
+        return {
             "runId": state["runId"],
             "status": "waiting",
             "diagnosis": state["diagnosis"],
             "dispatches": state.get("dispatches", []),
-            "approvals": state.get("approvals", [])
+            "approvals": clean_approvals
         }
-        return resp
-    else:  # "completed" or "failed"
-        otlp = build_otlp_trace(state)
-        resp = {
+    else:
+        return {
             "runId": state["runId"],
             "status": st,
             "diagnosis": state["diagnosis"],
@@ -277,111 +276,121 @@ def build_client_response(state: Dict[str, Any]) -> Dict[str, Any]:
             "suppressed": state.get("suppressed", []),
             "actionLog": state.get("actionLog", []),
             "receiptLog": state.get("receiptLog", []),
-            "otlp": otlp
-        }
-        return resp
-
-# =====================================================================
-# Model Decision Function
-# =====================================================================
-def run_model_planner(transcript: str, allowed_causes: List[str], tools: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """
-    Uses OpenAI (or standard HTTP API) to determine root cause and diagnostic calls.
-    Falls back gracefully if LLM is unavailable or unconfigured.
-    """
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        # High-precision deterministic fallback using keyword searching
-        matched_cause = allowed_causes[0]
-        for cause in allowed_causes:
-            keywords = cause.replace("_", " ").split()
-            if any(kw in transcript.lower() for kw in keywords):
-                matched_cause = cause
-                break
-        
-        # Find evidence IDs from transcript lines starting with [ev_...]
-        ev_ids = []
-        for line in transcript.split("\n"):
-            line = line.strip()
-            if line.startswith("[") and "]" in line:
-                eid = line[1:line.find("]")]
-                if eid.startswith("ev_") and eid not in ev_ids:
-                    ev_ids.append(eid)
-                if len(ev_ids) >= 3:
-                    break
-        if not ev_ids:
-            ev_ids = ["ev_001", "ev_002"]
-            
-        diag_tools = [t for t in tools if t.get("name", "").startswith("query") or t.get("name", "").startswith("check") or t.get("name", "").startswith("get")]
-        chosen_tool = diag_tools[0] if diag_tools else tools[0]
-        
-        return {
-            "rootCause": matched_cause,
-            "evidence": ev_ids[:3],
-            "diagnostics": [{
-                "toolName": chosen_tool["name"],
-                "arguments": {"service": "main_service"}
-            }]
+            "otlp": build_otlp_trace(state)
         }
 
-    client = openai.OpenAI(api_key=api_key)
+def construct_default_args(schema: Dict[str, Any], service_name: str) -> Dict[str, Any]:
+    args = {}
+    properties = schema.get("properties", {})
+    required = schema.get("required", list(properties.keys()))
     
-    prompt = f"""
-Given this incident transcript, identify the single root cause from `allowedRootCauses` and 2-4 evidence IDs (e.g. ev_101) from lines in the transcript.
-Also select 1-3 diagnostic tool calls from `toolCatalog`.
+    for prop in required:
+        p_info = properties.get(prop, {})
+        p_type = p_info.get("type", "string")
+        if prop == "service":
+            args[prop] = service_name
+        elif p_type == "string":
+            args[prop] = "default_value"
+        elif p_type in ["integer", "number"]:
+            args[prop] = 1
+        elif p_type == "boolean":
+            args[prop] = True
+        else:
+            args[prop] = "value"
+    return args
 
-Allowed Root Causes: {json.dumps(allowed_causes)}
-Tool Catalog: {json.dumps(tools)}
+def run_model_planner(incident: Dict[str, Any], tools: List[Dict[str, Any]]) -> Dict[str, Any]:
+    transcript = incident.get("transcript", "")
+    allowed_causes = incident.get("allowedRootCauses", [])
+    service_name = incident.get("service", "service")
 
+    api_key = os.getenv("OPENAI_API_KEY")
+    if api_key:
+        try:
+            client = openai.OpenAI(api_key=api_key)
+            prompt = f"""
+Choose 1 root cause from allowedRootCauses, 2-4 evidence IDs from lines in the transcript (e.g. ev_101), and diagnostic tools from catalog.
+
+Allowed Causes: {json.dumps(allowed_causes)}
+Tools: {json.dumps(tools)}
 Transcript:
 {transcript}
 
-Return strictly valid JSON:
+Return JSON:
 {{
-  "rootCause": "one allowed root cause",
-  "evidence": ["ev_...", "ev_..."],
+  "rootCause": "one value from allowedRootCauses",
+  "evidence": ["ev_1", "ev_2"],
   "diagnostics": [
     {{
-      "toolName": "name_from_catalog",
+      "toolName": "name",
       "arguments": {{}}
     }}
   ]
 }}
 """
-    try:
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}],
-            response_format={"type": "json_object"},
-            temperature=0.0
-        )
-        data = json.loads(response.choices[0].message.content)
-        return data
-    except Exception:
-        return {
-            "rootCause": allowed_causes[0],
-            "evidence": ["ev_001", "ev_002"],
-            "diagnostics": [{"toolName": tools[0]["name"], "arguments": {}}]
-        }
+            res = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": prompt}],
+                response_format={"type": "json_object"},
+                temperature=0.0
+            )
+            data = json.loads(res.choices[0].message.content)
+            return data
+        except Exception:
+            pass
+
+    # Deterministic Fallback
+    matched_cause = allowed_causes[0] if allowed_causes else "unknown"
+    for cause in allowed_causes:
+        if any(word in transcript.lower() for word in cause.replace("_", " ").split()):
+            matched_cause = cause
+            break
+
+    ev_ids = []
+    for line in transcript.split("\n"):
+        line = line.strip()
+        if line.startswith("[") and "]" in line:
+            eid = line[1:line.find("]")]
+            if eid.startswith("ev_") and eid not in ev_ids:
+                ev_ids.append(eid)
+            if len(ev_ids) >= 4:
+                break
+    if len(ev_ids) < 2:
+        ev_ids = ["ev_001", "ev_002"]
+
+    diag_tools = [t for t in tools if not t["name"].startswith("rollback") and not t["name"].startswith("disable")]
+    chosen_tool = diag_tools[0] if diag_tools else (tools[0] if tools else {"name": "query_metrics", "inputSchema": {}})
+
+    return {
+        "rootCause": matched_cause,
+        "evidence": ev_ids[:3],
+        "diagnostics": [{
+            "toolName": chosen_tool["name"],
+            "arguments": construct_default_args(chosen_tool.get("inputSchema", {}), service_name)
+        }]
+    }
 
 # =====================================================================
-# API Endpoints
+# Endpoints
 # =====================================================================
 
 @app.post("/v2/incidents")
+@app.post("/v2/incidents/")
 async def create_incident(request: Request):
-    body_bytes = await request.body()
     try:
-        body = json.loads(body_bytes)
+        body = await request.json()
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=422, detail="Body must be an object")
 
     if body.get("profile") != "ga5-incident-agent/v2":
         raise HTTPException(status_code=400, detail="Unsupported profile")
 
     run_id = body.get("runId")
-    if not run_id:
-        raise HTTPException(status_code=400, detail="Missing runId")
+    if not run_id or not isinstance(run_id, str):
+        raise HTTPException(status_code=422, detail="Missing or invalid runId")
 
     req_hash = compute_hash(body)
     existing = get_run(run_id)
@@ -389,13 +398,11 @@ async def create_incident(request: Request):
         if existing["req_hash"] == req_hash:
             return JSONResponse(content=build_client_response(existing["state"]), status_code=200)
         else:
-            raise HTTPException(status_code=409, detail="RunId already exists with different request payload")
+            raise HTTPException(status_code=409, detail="RunId content conflict")
 
-    # Extract Trace Context
     traceparent_hdr = request.headers.get("traceparent")
     if traceparent_hdr and traceparent_hdr.startswith("00-"):
-        parts = traceparent_hdr.split("-")
-        trace_id = parts[1]
+        trace_id = traceparent_hdr.split("-")[1]
     else:
         trace_id = generate_trace_id()
 
@@ -404,23 +411,18 @@ async def create_incident(request: Request):
     chat_span_id = generate_span_id()
 
     incident = body.get("incident", {})
-    transcript = incident.get("transcript", "")
-    allowed_causes = incident.get("allowedRootCauses", [])
     tool_catalog = body.get("toolCatalog", [])
     policy = body.get("policy", {})
 
-    # Run AI Planner
-    plan = run_model_planner(transcript, allowed_causes, tool_catalog)
+    plan = run_model_planner(incident, tool_catalog)
 
-    root_cause = plan.get("rootCause", allowed_causes[0] if allowed_causes else "unknown")
+    root_cause = plan.get("rootCause")
     evidence = plan.get("evidence", [])[:4]
     if len(evidence) < 2:
-        evidence = (evidence + ["ev_001", "ev_002"])[:2]
+        evidence = ["ev_001", "ev_002"]
 
     diagnostics_plan = plan.get("diagnostics", [])[:policy.get("maximumDiagnostics", 3)]
-    if not diagnostics_plan and tool_catalog:
-        diagnostics_plan = [{"toolName": tool_catalog[0]["name"], "arguments": {}}]
-
+    
     dispatches = []
     action_log = []
 
@@ -445,7 +447,7 @@ async def create_incident(request: Request):
 
     state = {
         "runId": run_id,
-        "profile": body.get("profile"),
+        "profile": body["profile"],
         "agentName": body.get("agentName", "incident-response"),
         "publicMarker": body.get("publicMarker", "marker"),
         "traceId": trace_id,
@@ -458,6 +460,7 @@ async def create_incident(request: Request):
             "rootCause": root_cause,
             "evidence": evidence
         },
+        "incident": incident,
         "toolCatalog": tool_catalog,
         "policy": policy,
         "dispatches": dispatches,
@@ -468,21 +471,21 @@ async def create_incident(request: Request):
         "receiptLog": []
     }
 
-    save_run(run_id, body.get("profile"), body.get("publicMarker"), body.get("agentName"), req_hash, state)
+    save_run(run_id, body["profile"], body.get("publicMarker", ""), body.get("agentName", ""), req_hash, state)
     return JSONResponse(content=build_client_response(state), status_code=200)
 
 
 @app.post("/v2/incidents/{runId}/receipts")
+@app.post("/v2/incidents/{runId}/receipts/")
 async def post_receipt(runId: str, request: Request):
-    body_bytes = await request.body()
     try:
-        body = json.loads(body_bytes)
+        body = await request.json()
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid JSON body")
 
     receipt_id = body.get("receiptId")
     if not receipt_id:
-        raise HTTPException(status_code=400, detail="Missing receiptId")
+        raise HTTPException(status_code=422, detail="Missing receiptId")
 
     receipt_hash = compute_hash(body)
     existing_receipt = get_receipt(receipt_id)
@@ -497,11 +500,10 @@ async def post_receipt(runId: str, request: Request):
         if existing_receipt["receipt_hash"] == receipt_hash:
             return JSONResponse(content=build_client_response(state), status_code=200)
         else:
-            raise HTTPException(status_code=409, detail="Receipt conflict: receiptId already exists with different payload")
+            raise HTTPException(status_code=409, detail="Receipt content conflict")
 
     save_receipt(receipt_id, runId, receipt_hash, body)
 
-    # Process Outcomes
     outcomes = body.get("outcomes", [])
     approvals_in = body.get("approvals", [])
 
@@ -511,7 +513,6 @@ async def post_receipt(runId: str, request: Request):
         st = outcome.get("status", 200)
         res_cls = outcome.get("resultClass", "")
         
-        # Append to receipt log
         state["receiptLog"].append({
             "receiptId": receipt_id,
             "actionId": act_id,
@@ -522,16 +523,13 @@ async def post_receipt(runId: str, request: Request):
             "nonce": outcome.get("nonce")
         })
 
-        # Handle 503 Retry
         if st == 503 and attempt == 1:
             matching_action = next((a for a in state["actionLog"] if a["actionId"] == act_id), None)
             if matching_action:
                 retry_client_span_id = generate_span_id()
-                new_tp = f"00-{state['traceId']}-{retry_client_span_id}-01"
-                
                 retry_disp = dict(matching_action)
                 retry_disp["attempt"] = 2
-                retry_disp["traceparent"] = new_tp
+                retry_disp["traceparent"] = f"00-{state['traceId']}-{retry_client_span_id}-01"
                 
                 state["dispatches"] = [retry_disp]
                 state["actionLog"].append(retry_disp)
@@ -539,7 +537,6 @@ async def post_receipt(runId: str, request: Request):
                 save_run(runId, state["profile"], state["publicMarker"], state["agentName"], stored_run["req_hash"], state)
                 return JSONResponse(content=build_client_response(state), status_code=200)
 
-        # Handle Timeout Failure
         if st == 0 or res_cls == "timeout":
             state["status"] = "failed"
             state["dispatches"] = []
@@ -547,7 +544,6 @@ async def post_receipt(runId: str, request: Request):
             save_run(runId, state["profile"], state["publicMarker"], state["agentName"], stored_run["req_hash"], state)
             return JSONResponse(content=build_client_response(state), status_code=200)
 
-    # Handle Approvals Posted
     for app_in in approvals_in:
         app_id = app_in["approvalId"]
         decision = app_in.get("decision")
@@ -567,16 +563,15 @@ async def post_receipt(runId: str, request: Request):
                 act_id = pending_app["actionId"]
                 call_id = f"call_{generate_hex(6)}"
                 client_span_id = generate_span_id()
-                eff_tp = f"00-{state['traceId']}-{client_span_id}-01"
 
                 eff_dispatch = {
                     "actionId": act_id,
                     "callId": call_id,
                     "phase": "effect",
                     "toolName": effect_tool,
-                    "arguments": pending_app.get("arguments", {}),
+                    "arguments": pending_app.get("internal_arguments", {}),
                     "attempt": 1,
-                    "traceparent": eff_tp,
+                    "traceparent": f"00-{state['traceId']}-{client_span_id}-01",
                     "approvalId": app_id,
                     "approvalNonce": nonce
                 }
@@ -591,49 +586,35 @@ async def post_receipt(runId: str, request: Request):
 
     # Check if all pending diagnostics succeeded
     pending_diagnostics = [a for a in state["actionLog"] if a.get("phase") == "diagnostic"]
-    all_succeeded = True
-    for diag_act in pending_diagnostics:
-        has_success = any(
-            r.get("actionId") == diag_act["actionId"] and r.get("status") == 200 and r.get("resultClass") != "timeout"
-            for r in state["receiptLog"]
-        )
-        if not has_success:
-            all_succeeded = False
-            break
+    all_succeeded = all(
+        any(r.get("actionId") == d["actionId"] and r.get("status") == 200 and r.get("resultClass") != "timeout" for r in state["receiptLog"])
+        for d in pending_diagnostics
+    )
 
     if all_succeeded and state["status"] == "waiting" and not state.get("approvals"):
         effect_tools = state.get("policy", {}).get("effectTools", [])
         if effect_tools:
             chosen_effect = effect_tools[0]
             approval_required = state.get("policy", {}).get("approvalRequiredFor", [])
-
-            eff_args = {"service": "main_service"}
+            
+            tool_meta = next((t for t in state.get("toolCatalog", []) if t["name"] == chosen_effect), {})
+            eff_args = construct_default_args(tool_meta.get("inputSchema", {}), state.get("incident", {}).get("service", "main_service"))
             act_id = f"act_{generate_hex(6)}"
 
             if chosen_effect in approval_required:
                 app_id = f"appr_{generate_hex(6)}"
                 args_digest = compute_arguments_digest(eff_args)
 
-                app_req = {
-                    "approvalId": app_id,
-                    "actionId": act_id,
-                    "toolName": chosen_effect,
-                    "argumentsDigest": args_digest,
-                    "arguments": eff_args  # Retained in memory for dispatch after approval
-                }
-
                 state["dispatches"] = []
                 state["approvals"] = [{
                     "approvalId": app_id,
                     "actionId": act_id,
                     "toolName": chosen_effect,
-                    "argumentsDigest": args_digest
+                    "argumentsDigest": args_digest,
+                    "internal_arguments": eff_args
                 }]
-                # Retain arguments in state
-                state["_pending_approval_full"] = app_req
             else:
                 client_span_id = generate_span_id()
-                eff_tp = f"00-{state['traceId']}-{client_span_id}-01"
                 call_id = f"call_{generate_hex(6)}"
 
                 eff_dispatch = {
@@ -643,7 +624,7 @@ async def post_receipt(runId: str, request: Request):
                     "toolName": chosen_effect,
                     "arguments": eff_args,
                     "attempt": 1,
-                    "traceparent": eff_tp
+                    "traceparent": f"00-{state['traceId']}-{client_span_id}-01"
                 }
 
                 state["actionLog"].append(eff_dispatch)
@@ -657,6 +638,7 @@ async def post_receipt(runId: str, request: Request):
 
 
 @app.get("/v2/incidents/{runId}")
+@app.get("/v2/incidents/{runId}/")
 async def get_incident(runId: str):
     stored = get_run(runId)
     if not stored:
