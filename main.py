@@ -11,7 +11,7 @@ from fastapi.responses import JSONResponse
 import openai
 
 # =====================================================================
-# Database Setup
+# Database Setup (SQLite for persistent run state & idempotency)
 # =====================================================================
 DB_FILE = "incident_agent.db"
 
@@ -44,7 +44,7 @@ init_db()
 app = FastAPI(title="Observable Incident Agent", version="v2")
 
 # =====================================================================
-# Helpers & Digest Utilities
+# Helpers & Cryptographic Utilities
 # =====================================================================
 def compute_hash(data: Any) -> str:
     canonical = json.dumps(data, sort_keys=True, separators=(',', ':'))
@@ -100,10 +100,10 @@ def save_receipt(receipt_id: str, run_id: str, receipt_hash: str, payload: Dict[
         conn.commit()
 
 # =====================================================================
-# Deterministic Evidence & Argument Extractor
+# Evidence & Schema Argument Extractor
 # =====================================================================
 def extract_evidence_ids(transcript: str) -> List[str]:
-    """Extracts all explicit [ev_...] tags from transcript lines."""
+    """Finds all explicit [ev_...] tags in the transcript."""
     matches = re.findall(r'\[(ev_[a-zA-Z0-9_\-]+)\]', transcript)
     seen = []
     for m in matches:
@@ -112,7 +112,7 @@ def extract_evidence_ids(transcript: str) -> List[str]:
     return seen
 
 def extract_case_arguments(tool_schema: Dict[str, Any], incident: Dict[str, Any]) -> Dict[str, Any]:
-    """Extracts exact values matching schema properties from incident metadata."""
+    """Derives exact schema-conforming arguments from incident context."""
     args = {}
     properties = tool_schema.get("properties", {})
     required = tool_schema.get("required", list(properties.keys()))
@@ -130,7 +130,6 @@ def extract_case_arguments(tool_schema: Dict[str, Any], incident: Dict[str, Any]
         elif prop in ["incident_id", "incidentId"]:
             args[prop] = incident_id
         else:
-            # Match regex in transcript for property value if present
             pattern = re.compile(rf"{prop}[:=]\s*([a-zA-Z0-9_\-]+)", re.IGNORECASE)
             match = pattern.search(transcript)
             if match:
@@ -145,6 +144,9 @@ def extract_case_arguments(tool_schema: Dict[str, Any], incident: Dict[str, Any]
             
     return args
 
+# =====================================================================
+# AI Model Planner (Groq -> OpenAI -> Deterministic Fallback)
+# =====================================================================
 def run_model_planner(incident: Dict[str, Any], tool_catalog: List[Dict[str, Any]], policy: Dict[str, Any]) -> Dict[str, Any]:
     transcript = incident.get("transcript", "")
     allowed_causes = incident.get("allowedRootCauses", [])
@@ -153,16 +155,29 @@ def run_model_planner(incident: Dict[str, Any], tool_catalog: List[Dict[str, Any
     effect_tool_names = policy.get("effectTools", [])
     diagnostic_tools = [t for t in tool_catalog if t["name"] not in effect_tool_names]
     
-    api_key = os.getenv("OPENAI_API_KEY")
-    if api_key:
+    groq_api_key = os.getenv("GROQ_API_KEY")
+    openai_api_key = os.getenv("OPENAI_API_KEY")
+    
+    client = None
+    model_name = "gpt-4o-mini"
+    
+    if groq_api_key:
+        client = openai.OpenAI(
+            api_key=groq_api_key,
+            base_url="https://api.groq.com/openai/v1"
+        )
+        model_name = "llama-3.3-70b-versatile"
+    elif openai_api_key:
+        client = openai.OpenAI(api_key=openai_api_key)
+        model_name = "gpt-4o-mini"
+
+    if client:
         try:
-            client = openai.OpenAI(api_key=api_key)
             prompt = f"""
-Analyze this incident transcript to determine the single root cause and cite 2 to 4 evidence IDs.
-Select 1 to {policy.get('maximumDiagnostics', 3)} diagnostic tools required to confirm the issue.
+Analyze this incident transcript. Choose 1 root cause from allowedRootCauses, 2 to 4 evidence IDs present in the transcript, and 1 to {policy.get('maximumDiagnostics', 3)} diagnostic tools from the catalog.
 
 Allowed Root Causes: {json.dumps(allowed_causes)}
-Available Evidence IDs: {json.dumps(all_evidence)}
+Available Evidence IDs in Transcript: {json.dumps(all_evidence)}
 Diagnostic Tools Catalog: {json.dumps(diagnostic_tools)}
 
 Transcript:
@@ -170,7 +185,7 @@ Transcript:
 
 Return strictly structured JSON:
 {{
-  "rootCause": "one string from allowedRootCauses",
+  "rootCause": "matching cause string",
   "evidence": ["ev_...", "ev_..."],
   "diagnostics": [
     {{
@@ -181,7 +196,7 @@ Return strictly structured JSON:
 }}
 """
             res = client.chat.completions.create(
-                model="gpt-4o-mini",
+                model=model_name,
                 messages=[{"role": "user", "content": prompt}],
                 response_format={"type": "json_object"},
                 temperature=0.0
@@ -194,11 +209,12 @@ Return strictly structured JSON:
             else:
                 data["evidence"] = all_evidence[:3] if len(all_evidence) >= 2 else all_evidence
                 
+            data["_model_used"] = model_name
             return data
         except Exception:
             pass
 
-    # Deterministic Local Planner Fallback
+    # Local Deterministic Fallback Engine
     selected_cause = allowed_causes[0] if allowed_causes else "unknown"
     for cause in allowed_causes:
         cause_tokens = cause.replace("_", " ").split()
@@ -219,11 +235,12 @@ Return strictly structured JSON:
     return {
         "rootCause": selected_cause,
         "evidence": chosen_evidence,
-        "diagnostics": diagnostics
+        "diagnostics": diagnostics,
+        "_model_used": "local-fallback"
     }
 
 # =====================================================================
-# Strict OTLP Trace Builder
+# Strict OTLP Trace Generator
 # =====================================================================
 def build_otlp_trace(state: Dict[str, Any]) -> Dict[str, Any]:
     run_id = state["runId"]
@@ -270,7 +287,7 @@ def build_otlp_trace(state: Dict[str, Any]) -> Dict[str, Any]:
         "kind": 3,  # CLIENT
         "attributes": common_attrs + [
             {"key": "gen_ai.operation.name", "value": {"stringValue": "chat"}},
-            {"key": "gen_ai.request.model", "value": {"stringValue": state.get("modelName", "gpt-4o-mini")}}
+            {"key": "gen_ai.request.model", "value": {"stringValue": state.get("modelName", "llama-3.3-70b-versatile")}}
         ]
     })
     
@@ -296,7 +313,7 @@ def build_otlp_trace(state: Dict[str, Any]) -> Dict[str, Any]:
             ]
         })
         
-        # CLIENT Span ID extracted directly from traceparent
+        # Match CLIENT span ID directly with traceparent
         client_span_id = action["traceparent"].split("-")[2]
         
         receipt = next((r for r in state.get("receiptLog", []) 
@@ -304,9 +321,9 @@ def build_otlp_trace(state: Dict[str, Any]) -> Dict[str, Any]:
         
         client_attrs = common_attrs + [
             {"key": "ga5.action.id", "value": {"stringValue": action["actionId"]}},
-            {"key": "ga5.attempt", "value": {"intValue": action["attempt"]}},
+            {"key": "ga5.attempt", "value": {"intValue": int(action["attempt"])}},
             {"key": "http.request.method", "value": {"stringValue": "POST"}},
-            {"key": "http.request.resend_count", "value": {"intValue": action["attempt"] - 1}}
+            {"key": "http.request.resend_count", "value": {"intValue": int(action["attempt"]) - 1}}
         ]
         
         span_status = {"code": 0}  # UNSET
@@ -405,7 +422,7 @@ def build_client_response(state: Dict[str, Any]) -> Dict[str, Any]:
         }
 
 # =====================================================================
-# Endpoints
+# API Endpoints
 # =====================================================================
 
 @app.post("/v2/incidents")
@@ -457,11 +474,14 @@ async def create_incident(request: Request):
     dispatches = []
     action_log = []
 
-    for diag in diagnostics_plan:
+    for idx, diag in enumerate(diagnostics_plan):
         action_id = generate_opaque_id("act")
         call_id = generate_opaque_id("call")
         client_span_id = generate_span_id()
         disp_tp = f"00-{trace_id}-{client_span_id}-01"
+        
+        # Every dispatch cites at least one evidence ID from diagnosis
+        cited_ev = [evidence[idx % len(evidence)]] if evidence else []
         
         disp = {
             "actionId": action_id,
@@ -469,7 +489,7 @@ async def create_incident(request: Request):
             "phase": "diagnostic",
             "toolName": diag["toolName"],
             "arguments": diag.get("arguments", {}),
-            "evidence": [evidence[0]] if evidence else [],
+            "evidence": cited_ev,
             "attempt": 1,
             "traceparent": disp_tp
         }
@@ -485,7 +505,7 @@ async def create_incident(request: Request):
         "serverSpanId": server_span_id,
         "agentSpanId": agent_span_id,
         "chatSpanId": chat_span_id,
-        "modelName": "gpt-4o-mini",
+        "modelName": plan.get("_model_used", "llama-3.3-70b-versatile"),
         "status": "waiting",
         "diagnosis": {
             "rootCause": root_cause,
