@@ -5,7 +5,7 @@ import hashlib
 import time
 import secrets
 from typing import Dict, Any, List, Optional
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, Request, status
 from fastapi.responses import JSONResponse
 import openai
 
@@ -40,7 +40,7 @@ def init_db():
 
 init_db()
 
-app = FastAPI(title="Observable Incident Agent", version="v2", redirect_slashes=False)
+app = FastAPI(title="Observable Incident Agent", version="v2")
 
 # =====================================================================
 # Helpers
@@ -52,8 +52,9 @@ def compute_hash(data: Any) -> str:
 def compute_arguments_digest(args: Dict[str, Any]) -> str:
     return compute_hash(args)
 
-def generate_hex(length_bytes: int = 8) -> str:
-    return secrets.token_hex(length_bytes)
+def generate_opaque_id(prefix: str = "id") -> str:
+    # Guarantees opaque string >= 12 chars
+    return f"{prefix}_{secrets.token_hex(8)}"
 
 def generate_trace_id() -> str:
     return secrets.token_hex(16)
@@ -118,32 +119,32 @@ def build_otlp_trace(state: Dict[str, Any]) -> Dict[str, Any]:
         {"key": "ga5.public.marker", "value": {"stringValue": public_marker}}
     ]
     
-    # 1. SERVER Span
+    # 1. SERVER Span: POST /v2/incidents
     spans.append({
         "traceId": trace_id,
         "spanId": server_span_id,
         "name": "POST /v2/incidents",
-        "kind": 2,
+        "kind": 2,  # SERVER
         "attributes": common_attrs
     })
     
-    # 2. INTERNAL invoke_agent Span
+    # 2. INTERNAL Span: invoke_agent
     spans.append({
         "traceId": trace_id,
         "spanId": agent_span_id,
         "parentSpanId": server_span_id,
         "name": f"invoke_agent {agent_name}",
-        "kind": 1,
+        "kind": 1,  # INTERNAL
         "attributes": common_attrs
     })
     
-    # 3. CLIENT chat incident-plan Span
+    # 3. CLIENT Span: chat incident-plan (Exactly 1)
     spans.append({
         "traceId": trace_id,
         "spanId": chat_span_id,
         "parentSpanId": agent_span_id,
         "name": "chat incident-plan",
-        "kind": 3,
+        "kind": 3,  # CLIENT
         "attributes": common_attrs + [
             {"key": "gen_ai.operation.name", "value": {"stringValue": "chat"}},
             {"key": "gen_ai.request.model", "value": {"stringValue": state.get("modelName", "gpt-4o-mini")}}
@@ -153,7 +154,7 @@ def build_otlp_trace(state: Dict[str, Any]) -> Dict[str, Any]:
     diagnostic_exec_span_ids = []
     
     for action in state.get("actionLog", []):
-        exec_span_id = f"{hashlib.sha256((action['actionId'] + '_exec').encode()).hexdigest()[:16]}"
+        exec_span_id = hashlib.sha256((action['actionId'] + '_exec').encode()).hexdigest()[:16]
         
         if action.get("phase") == "diagnostic":
             diagnostic_exec_span_ids.append(exec_span_id)
@@ -163,7 +164,7 @@ def build_otlp_trace(state: Dict[str, Any]) -> Dict[str, Any]:
             "spanId": exec_span_id,
             "parentSpanId": agent_span_id,
             "name": f"execute_tool {action['toolName']}",
-            "kind": 1,
+            "kind": 1,  # INTERNAL
             "attributes": common_attrs + [
                 {"key": "ga5.action.id", "value": {"stringValue": action["actionId"]}},
                 {"key": "gen_ai.tool.name", "value": {"stringValue": action["toolName"]}},
@@ -183,7 +184,7 @@ def build_otlp_trace(state: Dict[str, Any]) -> Dict[str, Any]:
             {"key": "http.request.resend_count", "value": {"intValue": action["attempt"] - 1}}
         ]
         
-        span_status = {"code": 0}
+        span_status = {"code": 0}  # UNSET
         
         if receipt:
             client_attrs.append({"key": "ga5.receipt.id", "value": {"stringValue": receipt["receiptId"]}})
@@ -205,14 +206,14 @@ def build_otlp_trace(state: Dict[str, Any]) -> Dict[str, Any]:
             "spanId": client_span_id,
             "parentSpanId": exec_span_id,
             "name": f"POST tool/{action['toolName']}",
-            "kind": 3,
+            "kind": 3,  # CLIENT
             "attributes": client_attrs,
             "status": span_status
         })
 
     # Join span for parallel diagnostics
     if len(diagnostic_exec_span_ids) > 1:
-        join_span_id = f"{hashlib.sha256((run_id + '_join').encode()).hexdigest()[:16]}"
+        join_span_id = hashlib.sha256((run_id + '_join').encode()).hexdigest()[:16]
         spans.append({
             "traceId": trace_id,
             "spanId": join_span_id,
@@ -226,7 +227,7 @@ def build_otlp_trace(state: Dict[str, Any]) -> Dict[str, Any]:
     # Approval gate span
     appr_receipt = next((r for r in state.get("receiptLog", []) if "approvalId" in r), None)
     if appr_receipt:
-        gate_span_id = f"{hashlib.sha256((run_id + '_appr').encode()).hexdigest()[:16]}"
+        gate_span_id = hashlib.sha256((run_id + '_appr').encode()).hexdigest()[:16]
         spans.append({
             "traceId": trace_id,
             "spanId": gate_span_id,
@@ -250,7 +251,6 @@ def build_otlp_trace(state: Dict[str, Any]) -> Dict[str, Any]:
 def build_client_response(state: Dict[str, Any]) -> Dict[str, Any]:
     st = state["status"]
     if st == "waiting":
-        # Format approvals clean of private internal argument mappings
         clean_approvals = [
             {
                 "approvalId": a["approvalId"],
@@ -375,22 +375,21 @@ Return JSON:
 # =====================================================================
 
 @app.post("/v2/incidents")
-@app.post("/v2/incidents/")
 async def create_incident(request: Request):
     try:
         body = await request.json()
     except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON body")
+        return JSONResponse(status_code=400, content={"error": "Invalid JSON body"})
 
     if not isinstance(body, dict):
-        raise HTTPException(status_code=422, detail="Body must be an object")
+        return JSONResponse(status_code=422, content={"error": "Body must be an object"})
 
     if body.get("profile") != "ga5-incident-agent/v2":
-        raise HTTPException(status_code=400, detail="Unsupported profile")
+        return JSONResponse(status_code=400, content={"error": "Unsupported profile"})
 
     run_id = body.get("runId")
     if not run_id or not isinstance(run_id, str):
-        raise HTTPException(status_code=422, detail="Missing or invalid runId")
+        return JSONResponse(status_code=422, content={"error": "Missing or invalid runId"})
 
     req_hash = compute_hash(body)
     existing = get_run(run_id)
@@ -398,7 +397,7 @@ async def create_incident(request: Request):
         if existing["req_hash"] == req_hash:
             return JSONResponse(content=build_client_response(existing["state"]), status_code=200)
         else:
-            raise HTTPException(status_code=409, detail="RunId content conflict")
+            return JSONResponse(status_code=409, content={"error": "RunId content conflict"})
 
     traceparent_hdr = request.headers.get("traceparent")
     if traceparent_hdr and traceparent_hdr.startswith("00-"):
@@ -427,8 +426,8 @@ async def create_incident(request: Request):
     action_log = []
 
     for diag in diagnostics_plan:
-        action_id = f"act_{generate_hex(6)}"
-        call_id = f"call_{generate_hex(6)}"
+        action_id = generate_opaque_id("act")
+        call_id = generate_opaque_id("call")
         client_span_id = generate_span_id()
         disp_tp = f"00-{trace_id}-{client_span_id}-01"
         
@@ -476,23 +475,22 @@ async def create_incident(request: Request):
 
 
 @app.post("/v2/incidents/{runId}/receipts")
-@app.post("/v2/incidents/{runId}/receipts/")
 async def post_receipt(runId: str, request: Request):
     try:
         body = await request.json()
     except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON body")
+        return JSONResponse(status_code=400, content={"error": "Invalid JSON body"})
 
     receipt_id = body.get("receiptId")
     if not receipt_id:
-        raise HTTPException(status_code=422, detail="Missing receiptId")
+        return JSONResponse(status_code=422, content={"error": "Missing receiptId"})
 
     receipt_hash = compute_hash(body)
     existing_receipt = get_receipt(receipt_id)
     
     stored_run = get_run(runId)
     if not stored_run:
-        raise HTTPException(status_code=404, detail="Run not found")
+        return JSONResponse(status_code=404, content={"error": "Run not found"})
 
     state = stored_run["state"]
 
@@ -500,7 +498,7 @@ async def post_receipt(runId: str, request: Request):
         if existing_receipt["receipt_hash"] == receipt_hash:
             return JSONResponse(content=build_client_response(state), status_code=200)
         else:
-            raise HTTPException(status_code=409, detail="Receipt content conflict")
+            return JSONResponse(status_code=409, content={"error": "Receipt content conflict"})
 
     save_receipt(receipt_id, runId, receipt_hash, body)
 
@@ -561,7 +559,7 @@ async def post_receipt(runId: str, request: Request):
             if pending_app:
                 effect_tool = pending_app["toolName"]
                 act_id = pending_app["actionId"]
-                call_id = f"call_{generate_hex(6)}"
+                call_id = generate_opaque_id("call")
                 client_span_id = generate_span_id()
 
                 eff_dispatch = {
@@ -599,10 +597,10 @@ async def post_receipt(runId: str, request: Request):
             
             tool_meta = next((t for t in state.get("toolCatalog", []) if t["name"] == chosen_effect), {})
             eff_args = construct_default_args(tool_meta.get("inputSchema", {}), state.get("incident", {}).get("service", "main_service"))
-            act_id = f"act_{generate_hex(6)}"
+            act_id = generate_opaque_id("act")
 
             if chosen_effect in approval_required:
-                app_id = f"appr_{generate_hex(6)}"
+                app_id = generate_opaque_id("appr")
                 args_digest = compute_arguments_digest(eff_args)
 
                 state["dispatches"] = []
@@ -615,7 +613,7 @@ async def post_receipt(runId: str, request: Request):
                 }]
             else:
                 client_span_id = generate_span_id()
-                call_id = f"call_{generate_hex(6)}"
+                call_id = generate_opaque_id("call")
 
                 eff_dispatch = {
                     "actionId": act_id,
@@ -638,11 +636,10 @@ async def post_receipt(runId: str, request: Request):
 
 
 @app.get("/v2/incidents/{runId}")
-@app.get("/v2/incidents/{runId}/")
 async def get_incident(runId: str):
     stored = get_run(runId)
     if not stored:
-        raise HTTPException(status_code=404, detail="Run not found")
+        return JSONResponse(status_code=404, content={"error": "Run not found"})
     return JSONResponse(content=build_client_response(stored["state"]), status_code=200)
 
 if __name__ == "__main__":
