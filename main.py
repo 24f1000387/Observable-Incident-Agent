@@ -145,7 +145,7 @@ def extract_case_arguments(tool_schema: Dict[str, Any], incident: Dict[str, Any]
     return args
 
 # =====================================================================
-# AI Model Planner (Groq -> OpenAI -> Deterministic Fallback)
+# AI Model Planner (Groq -> OpenAI -> Fallback)
 # =====================================================================
 def run_model_planner(incident: Dict[str, Any], tool_catalog: List[Dict[str, Any]], policy: Dict[str, Any]) -> Dict[str, Any]:
     transcript = incident.get("transcript", "")
@@ -185,7 +185,7 @@ Transcript:
 
 Return strictly structured JSON:
 {{
-  "rootCause": "matching cause string",
+  "rootCause": "one string from allowedRootCauses",
   "evidence": ["ev_...", "ev_..."],
   "diagnostics": [
     {{
@@ -313,7 +313,7 @@ def build_otlp_trace(state: Dict[str, Any]) -> Dict[str, Any]:
             ]
         })
         
-        # Match CLIENT span ID directly with traceparent
+        # CLIENT Span ID derived directly from traceparent
         client_span_id = action["traceparent"].split("-")[2]
         
         receipt = next((r for r in state.get("receiptLog", []) 
@@ -393,6 +393,7 @@ def build_otlp_trace(state: Dict[str, Any]) -> Dict[str, Any]:
 def build_client_response(state: Dict[str, Any]) -> Dict[str, Any]:
     st = state["status"]
     if st == "waiting":
+        # Format approvals clean of private internal argument mappings
         clean_approvals = [
             {
                 "approvalId": a["approvalId"],
